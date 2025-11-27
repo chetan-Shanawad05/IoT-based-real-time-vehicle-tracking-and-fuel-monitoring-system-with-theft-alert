@@ -1,0 +1,309 @@
+/***************************************************************************************************
+ * Project: ESP32 Smart Vehicle Monitoring System
+ ***************************************************************************************************/
+#define BLYNK_TEMPLATE_ID "TMPL3fdbLZljx"
+#define BLYNK_TEMPLATE_NAME "Vehicle Tracker and Fuel Monitoring"
+#define TINY_GSM_MODEM_SIM800
+#include <TinyGsmClient.h>
+#include <TinyGPS++.h>
+#include <HardwareSerial.h>
+#define BLYNK_PRINT Serial
+#include <BlynkSimpleTinyGSM.h>
+
+const char apn[] = "airtelgprs.com";
+const char gprsUser[] = "";
+const char gprsPass[] = "";
+
+char auth[] = "AkS3TzXTYmNT000yuNCG-SkpHZ1MAtWc"; 
+
+const char* VEHICLE_NUMBER = "KA-32-AB-1234";
+const char* RECIPIENT_PHONE_NUMBER = "+916362475559";
+
+// --- Tank Configuration ---
+const float TANK_BOTTOM_RADIUS_CM = 8.0; 
+const float TANK_TOP_RADIUS_CM = 9.15;    
+const float TANK_HEIGHT_CM = 20.6;       
+
+// --- Alert Thresholds ---
+const float FUEL_DROP_THRESHOLD_LITRES = 0.100; //litres
+const float OVERSPEED_THRESHOLD_KMPH = 40.0;
+const unsigned long ALERT_COOLDOWN_MS = 20000;
+
+// --- Hardware Pins ---
+const int TRIG_PIN = 12;
+const int ECHO_PIN = 14;
+const int REED_SWITCH_PIN = 27;
+const int GPS_RX_PIN = 26;
+const int GPS_TX_PIN = 25;
+#define GSM_SERIAL Serial2
+const int GSM_RX_PIN = 16;
+const int GSM_TX_PIN = 17;
+
+// --- Blynk Virtual Pins according to dashboard datastreams 
+#define VPIN_FUEL_LITRES    V1
+#define VPIN_SPEED_KMPH     V2
+#define VPIN_TOTAL_DISTANCE V3
+#define VPIN_MILEAGE        V4
+#define VPIN_GPS_LOCATION   V5  
+#define VPIN_GPS_longitude  V6 
+#define VPIN_MAP_BUTTON     V10 
+#define VPIN_FUEL_CAP_STATUS V11
+
+// --- Serial & GPS Objects ---
+TinyGPSPlus gps;
+HardwareSerial gpsSerial(1); // Used UART1 for GPS
+TinyGsm modem(GSM_SERIAL);
+TinyGsmClient client(modem);
+
+BlynkTimer timer;
+
+// --- Global Variables ---
+float lastFuelLitres = 0.0;
+float fuelConsumedLitres = 0.0;
+float mileageKmpl = 0.0;
+double totalDistanceKm = 0.0;
+double lastLat = 0.0;
+double lastLon = 0.0;
+int lastDay = 0;
+unsigned long lastTheftAlertTime = 0;
+unsigned long lastCapAlertTime = 0;
+unsigned long lastSpeedAlertTime = 0;
+bool capAlertSent = false;
+
+
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n--- Blynk GSM Vehicle & Fuel Monitoring System Initializing ---");
+
+  // Initialize hardware pins
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(REED_SWITCH_PIN, INPUT_PULLUP);
+
+  // Initialize serial communication
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  GSM_SERIAL.begin(9600, SERIAL_8N1, GSM_RX_PIN, GSM_TX_PIN);
+  Serial.println("GPS and GSM Serials Initialized.");
+
+  // Initialize GSM modem
+  Serial.println("Initializing GSM modem...");
+  modem.init();
+  Serial.print("Modem Name: ");
+  Serial.println(modem.getModemName());
+
+  // --- Connect to Blynk (NEW) ---
+  Serial.println("Connecting to Blynk via GPRS...");
+  Blynk.begin(auth, modem, apn, gprsUser, gprsPass);
+  Serial.println("Blynk Connected.");
+  // -----------------------------
+
+  // Get initial readings
+  Serial.println("Getting initial fuel reading...");
+  lastFuelLitres = getFuelLitres();
+  Serial.print("Initial Fuel Level: ");
+  Serial.print(lastFuelLitres, 2);
+  Serial.println(" Litres");
+
+  // Setup the timer to call 'monitorAndSend' every 5 seconds
+  timer.setInterval(5000L, monitorAndSend);
+
+  Serial.println("Initialization complete. System is running.");
+}
+
+
+void loop() {
+  Blynk.run();
+  timer.run();
+  // Continuously process incoming GPS data
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+}
+
+void monitorAndSend() {
+  // 1. Process GPS data (calculates distance)
+  processGPSData();
+
+  float currentFuelLitres = getFuelLitres();
+
+  // 3. Check for fuel theft
+  float fuelDifference = lastFuelLitres - currentFuelLitres;
+  if (fuelDifference > FUEL_DROP_THRESHOLD_LITRES) {
+    if (millis() - lastTheftAlertTime > ALERT_COOLDOWN_MS) {
+      String msg = "Fuel Theft Alert! Vehicle: " + String(VEHICLE_NUMBER) + ". Possible Fuel theft detected. Location: " + getGPSLocationLink();
+      sendSmsAlert(msg);
+      lastTheftAlertTime = millis();
+    }
+  }
+
+  if (fuelDifference > 0) {
+    fuelConsumedLitres += fuelDifference;
+  }
+  lastFuelLitres = currentFuelLitres;
+
+  // 4. Check fuel cap status
+  bool isCapOpen = (digitalRead(REED_SWITCH_PIN) == HIGH);
+  if (isCapOpen) {
+    if (!capAlertSent && (millis() - lastCapAlertTime > ALERT_COOLDOWN_MS)) {
+      String msg = "Fuel Cap Alert! Vehicle: " + String(VEHICLE_NUMBER) + ". The fuel cap was opened. Location: " + getGPSLocationLink();
+      sendSmsAlert(msg);
+      lastCapAlertTime = millis();
+      capAlertSent = true;
+    }
+  } else {
+    capAlertSent = false;
+  }
+  // 5. Check for overspeeding
+  if (gps.speed.isValid() && gps.speed.kmph() > OVERSPEED_THRESHOLD_KMPH) {
+    if (millis() - lastSpeedAlertTime > ALERT_COOLDOWN_MS) {
+      String msg = "Overspeed Alert! Vehicle: " + String(VEHICLE_NUMBER) + " is travelling at " + String(gps.speed.kmph(), 1) + " km/h. Location: " + getGPSLocationLink();
+      sendSmsAlert(msg);
+      lastSpeedAlertTime = millis();
+    }
+  }
+
+  // 6. Calculate Mileage
+  if (fuelConsumedLitres > 0.5) {
+    mileageKmpl = totalDistanceKm / fuelConsumedLitres;
+  }
+
+  // 7. --- SEND ALL DATA TO BLYNK DASHBOARD 
+  Serial.println("--- Sending Data to Blynk ---");
+  Serial.print("Fuel: "); Serial.print(currentFuelLitres, 2);
+  Serial.print(" L | Speed: "); Serial.print(gps.speed.kmph(), 2);
+  Serial.print(" km/h | Sats: "); Serial.println(gps.satellites.value());
+
+  // Send data to all the widgets as per your list
+  Blynk.virtualWrite(VPIN_FUEL_LITRES, currentFuelLitres);
+  Blynk.virtualWrite(VPIN_SPEED_KMPH, gps.speed.kmph());
+  Blynk.virtualWrite(VPIN_TOTAL_DISTANCE, totalDistanceKm);
+  Blynk.virtualWrite(VPIN_MILEAGE, mileageKmpl);
+  
+  // Send 255 (ON) to the LED if cap is open, 0 (OFF) if closed
+  Blynk.virtualWrite(VPIN_FUEL_CAP_STATUS, isCapOpen ? 255 : 0);
+  
+  // --- MODIFIED GPS DATA HANDLING ---
+  if (gps.location.isValid()) {
+    // Send Latitude to V5
+    Blynk.virtualWrite(VPIN_GPS_LOCATION, gps.location.lat());
+    
+    // Send Longitude to V6
+    Blynk.virtualWrite(VPIN_GPS_longitude, gps.location.lng());
+
+    // --- Send URL to WebPage Button on V10 ---
+    String mapLink = getGPSLocationLink();
+    Blynk.setProperty(VPIN_MAP_BUTTON, "url", mapLink);
+    // You can also set the button text if you want
+    // Blynk.setProperty(VPIN_MAP_BUTTON, "label", "Open Map");
+
+  } else {
+    // Send error text to V5 and V6 if no GPS fix
+    Blynk.virtualWrite(VPIN_GPS_LOCATION, "No Fix");
+    Blynk.virtualWrite(VPIN_GPS_longitude, "No Fix");
+  }
+}
+void sendSmsAlert(String message) {
+  Serial.println("--- Sending SMS Alert ---");
+  Serial.println(message);
+  bool res = modem.sendSMS(RECIPIENT_PHONE_NUMBER, message);
+  if (res) {
+    Serial.println("SMS sent successfully!");
+  } else {
+    Serial.println("SMS failed to send.");
+  }
+}
+
+/**
+---Measures distance and calculates fuel volume in a FRUSTUM tank.
+ **/
+float getFuelLitres() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms timeout
+
+  if (duration > 0) {
+    // 1. Calculate distance from sensor (at top) to fuel surface
+    float distanceCm = duration * 0.0343 / 2.0;
+
+    // 2. Calculate fuel height from the bottom of the tank
+    float fuelHeightCm = TANK_HEIGHT_CM - distanceCm;
+    fuelHeightCm = constrain(fuelHeightCm, 0.0, TANK_HEIGHT_CM); // Clamp value
+
+    // 3. --- FRUSTUM VOLUME CALCULATION ---
+    // h = height of the fuel (fuelHeightCm)
+    // H = total height of the tank (TANK_HEIGHT_CM)
+    // R1 = bottom radius of the tank (TANK_BOTTOM_RADIUS_CM)
+    // R2 = top radius of the tank (TANK_TOP_RADIUS_CM)
+    
+    // Check for division by zero if tank height is 0
+    if (TANK_HEIGHT_CM == 0) {
+      return 0.0;
+    }
+
+    // 3a. Calculate the radius (rh) at the fuel's current surface height (h)
+    // This uses linear interpolation between the bottom and top radius
+    float rh = TANK_BOTTOM_RADIUS_CM + (TANK_TOP_RADIUS_CM - TANK_BOTTOM_RADIUS_CM) * (fuelHeightCm / TANK_HEIGHT_CM);
+
+    // 3b. Use the frustum volume formula: V = (1/3) * pi * h * (R1^2 + rh^2 + R1*rh)
+    float volumeCubicCm = (1.0 / 3.0) * PI * fuelHeightCm *
+                          ( (TANK_BOTTOM_RADIUS_CM * TANK_BOTTOM_RADIUS_CM) +
+                            (rh * rh) +
+                            (TANK_BOTTOM_RADIUS_CM * rh) );
+
+    // 4. Convert cubic cm (mL) to Litres
+    return volumeCubicCm / 1000.0;
+  }
+  
+  // If sensor read fails, return the last known value
+  return lastFuelLitres;
+}
+
+
+/**
+ * @brief Processes GPS data for distance calculation.
+ * (No changes made to this function)
+ */
+void processGPSData() {
+  if (!gps.location.isValid() || !gps.date.isValid()) {
+    return;
+  }
+
+  if (lastDay != 0 && gps.date.day() != lastDay) {
+    totalDistanceKm = 0.0;
+    fuelConsumedLitres = 0.0;
+    mileageKmpl = 0.0;
+  }
+  lastDay = gps.date.day();
+
+  if (lastLat != 0.0 && lastLon != 0.0) {
+    double distanceMovedMeters = TinyGPSPlus::distanceBetween(
+        gps.location.lat(), gps.location.lng(), lastLat, lastLon);
+    if (distanceMovedMeters > 5.0) { // Only add if moved more than 5 meters
+      totalDistanceKm += distanceMovedMeters / 1000.0;
+    }
+  }
+  lastLat = gps.location.lat();
+  lastLon = gps.location.lng();
+}
+
+/**
+ * @brief Gets the Google Maps link.
+ * (--- MODIFIED --- to use a working Google Maps URL format)
+ */
+String getGPSLocationLink() {
+  if (gps.location.isValid()) {
+    // This is the modern, working format for a Google Maps link
+    String link = "https://www.google.com/maps?q=";
+    link += String(gps.location.lat(), 6);
+    link += ",";
+    link += String(gps.location.lng(), 6);
+    return link;
+  } else {
+    // Return a default link if no location is available
+    return "https://www.google.com/maps";
+  }
+}
